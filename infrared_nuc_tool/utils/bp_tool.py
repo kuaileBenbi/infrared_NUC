@@ -101,7 +101,7 @@ def detect_bp_by_3sigma_generic_filter(
 ) -> np.ndarray:
     """
     根据3sigma法则检测孤立点认为为盲元
-    使用局部窗口计算均值和标准差
+    使用局部窗口计算均值和标准差，添加padding优化边界处理
 
     参数:
     - images: 图像数组 (num_temperatures, height, width)
@@ -125,11 +125,20 @@ def detect_bp_by_3sigma_generic_filter(
     if window_size % 2 == 0:
         window_size += 1
 
-    for image in images:
+    # 计算padding大小
+    pad_size = window_size // 2
 
+    for image in images:
+        # 添加padding，使用reflect模式处理边界
+        padded_image = np.pad(image, pad_size, mode='reflect')
+        
         # 使用generic_filter计算局部均值和标准差
-        local_means = generic_filter(image, local_mean, size=window_size)
-        local_stds = generic_filter(image, local_std, size=window_size)
+        local_means = generic_filter(padded_image, local_mean, size=window_size)
+        local_stds = generic_filter(padded_image, local_std, size=window_size)
+        
+        # 移除padding，恢复到原始尺寸
+        local_means = local_means[pad_size:pad_size+height, pad_size:pad_size+width]
+        local_stds = local_stds[pad_size:pad_size+height, pad_size:pad_size+width]
 
         # 计算阈值范围
         lower_bound = local_means - sigma * local_stds
@@ -169,3 +178,64 @@ def remove_bps(raw_arr: np.ndarray, bps: np.ndarray, ksize: int = 5) -> np.ndarr
     raw_arr[bps] = blurred[bps]
 
     return raw_arr.astype(np.uint16)
+
+
+if __name__ == "__main__":
+    path = "D:/Projects/2025/145corr/nuc/tanceqi/swir/swir/short_black_image"
+    save_path = "output"
+    os.makedirs(save_path, exist_ok=True)
+
+    temps = os.listdir(path)
+
+    for temp in temps:
+
+        print(f"Processing {temp} C...")
+
+        its = os.listdir(os.path.join(path, temp))
+
+        for it in its:
+
+            print(f"Processing {it}...")
+
+            bp_save_path = os.path.join(save_path, "bp", "swir", temp, it)
+            os.makedirs(bp_save_path, exist_ok=True)
+
+            bp_file = os.path.join(bp_save_path, "blind_pixels.npz")
+
+            bad_pixel_vis_path = os.path.join(save_path, "validation", "swir", temp, it)
+            os.makedirs(bad_pixel_vis_path, exist_ok=True)
+
+            imgs_names = os.listdir(os.path.join(path, temp, it))
+            imgs_names = imgs_names[:30]
+
+            imgs_names.sort()
+
+            imgs = []
+            for img_name in imgs_names:
+                img = cv2.imread(os.path.join(path, temp, it, img_name), -1)
+                imgs.append(img)
+
+            imgs = np.array(imgs)
+
+            bp_map = detect_bp_by_3sigma_generic_filter(imgs, sigma=3.0, window_size=47)
+            np.savez_compressed(bp_file, blind=bp_map.astype(bool))
+
+            img_med = imgs[0]
+            
+            img_med = img_med / 4095 * 255.0
+            img_rgb = cv2.cvtColor(img_med.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+
+            img_rgb[bp_map] = [255, 0, 0]
+
+            bad_pixel_img_path = os.path.join(bad_pixel_vis_path, f"bad_pixels_{it}ms.png")
+            cv2.imwrite(bad_pixel_img_path, img_rgb)
+
+            print(f"Processed {it}ms")
+        
+        print(f"Processed {temp} C")
+    
+    print("Done")
+
+
+
+            
