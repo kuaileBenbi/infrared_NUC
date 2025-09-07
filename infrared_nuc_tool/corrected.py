@@ -77,7 +77,7 @@ def run_pipeline(
 
         for temperature in tqdm.tqdm(temperatures_list, desc="Processing temperature"):
 
-            cur_temp_path = os.path.join(data_path, f"{temperature}")
+            cur_temp_path = os.path.join(data_path, f"{temperature}du")
 
             if not os.path.exists(cur_temp_path):
                 logger.info(f"Warning: {cur_temp_path} not found!")
@@ -150,100 +150,100 @@ def run_pipeline(
             logger.warning("没有可用的图像数据用于坏点检测")
             bad_pixel_map = None
 
-        # # ---------------- 分数法确定校准点（左边界） ----------------
-        # grays_arr = np.asarray(grays_ok, dtype=np.float32)
-        # temps_arr = np.asarray(temps_ok)
+        # ---------------- 分数法确定校准点（左边界） ----------------
+        grays_arr = np.asarray(grays_ok, dtype=np.float32)
+        temps_arr = np.asarray(temps_ok)
 
-        # if len(grays_arr) == 0:
-        #     logger.info("没有可用的平场样本。")
-        #     break
+        if len(grays_arr) == 0:
+            logger.info("没有可用的平场样本。")
+            break
 
-        # # 建议至少保留 3 个节点
-        # M_knots = max(3, int(len(grays_arr) * keep_ratio))
-        # qs = np.linspace(0.0, 1.0, M_knots)
+        # 建议至少保留 3 个节点
+        M_knots = max(3, int(len(grays_arr) * keep_ratio))
+        qs = np.linspace(0.0, 1.0, M_knots)
 
-        # # 在“灰度中值”上做分位
-        # knot_vals = np.quantile(grays_arr, qs).astype(np.float32)
+        # 在“灰度中值”上做分位
+        knot_vals = np.quantile(grays_arr, qs).astype(np.float32)
 
-        # # 排序（按灰度从低到高）
-        # order = np.argsort(grays_arr)
-        # grays_sorted = grays_arr[order]
-        # temps_sorted = temps_arr[order]
+        # 排序（按灰度从低到高）
+        order = np.argsort(grays_arr)
+        grays_sorted = grays_arr[order]
+        temps_sorted = temps_arr[order]
 
-        # # 用左边界选择：对每个分位灰度，取 >= 该值的最左索引
-        # idx = np.searchsorted(grays_sorted, knot_vals, side="left")
-        # idx = np.clip(idx, 0, len(grays_sorted) - 1)
+        # 用左边界选择：对每个分位灰度，取 >= 该值的最左索引
+        idx = np.searchsorted(grays_sorted, knot_vals, side="left")
+        idx = np.clip(idx, 0, len(grays_sorted) - 1)
 
-        # # 去重，避免多个分位落到同一索引
-        # idx_unique = np.unique(idx)
-        # selected_grays = grays_sorted[idx_unique]
-        # selected_temps = temps_sorted[idx_unique]
+        # 去重，避免多个分位落到同一索引
+        idx_unique = np.unique(idx)
+        selected_grays = grays_sorted[idx_unique]
+        selected_temps = temps_sorted[idx_unique]
 
-        # train_imgs, train_temps = select_training_data(
-        #     images_by_temp, knot_vals, mean_y_by_gray
-        # )
+        train_imgs, train_temps = select_training_data(
+            images_by_temp, knot_vals, mean_y_by_gray
+        )
 
-        # valid_temps = [
-        #     t for t in temperatures_list if t not in train_temps and t in images_by_temp
-        # ]
+        valid_temps = [
+            t for t in temperatures_list if t not in train_temps and t in images_by_temp
+        ]
 
-        # bit_max = int(bit_max)
+        bit_max = int(bit_max)
 
-        # logger.info(f"选择的温度与灰度值为：{selected_temps} {selected_grays}")
+        logger.info(f"选择的温度与灰度值为：{selected_temps} {selected_grays}")
 
-        # # ---------------- 线性校正 ----------------
+        # ---------------- 线性校正 ----------------
 
-        # logger.info(f"线性校正...")
+        logger.info(f"线性校正...")
 
-        # method_out_dir = os.path.join(linear_nuc_path, f"multi_point_calib.npz")
+        method_out_dir = os.path.join(linear_nuc_path, f"multi_point_calib.npz")
 
-        # a_linear, b_linear, ga_linear, gb_linear = linear_fit(
-        #     it_temps_arr=train_imgs,
-        #     x_arr=selected_grays,
-        #     bit_max=bit_max,
-        #     save_path=method_out_dir,
-        # )
+        a_linear, b_linear, ga_linear, gb_linear = linear_fit(
+            it_temps_arr=train_imgs,
+            x_arr=selected_grays,
+            bit_max=bit_max,
+            save_path=method_out_dir,
+        )
 
-        # if a_linear is None:
-        #     logger.info(
-        #         f"Warning: {wave}-{exposure//5000}ms-{temperature} C linear calibration failed!"
-        #     )
-        #     continue
+        if a_linear is None:
+            logger.info(
+                f"Warning: {wave}-{exposure//5000}ms-{temperature} C linear calibration failed!"
+            )
+            continue
 
-        # for t in valid_temps:
-        #     img = images_by_temp[t]
-        #     img_corr = linear_apply(
-        #         a_linear, b_linear, ga_linear, gb_linear, img, bit_max=bit_max
-        #     )
-        #     img_corr = (img_corr / img_corr.max()) * 255.0
-        #     img_corr = img_corr.astype(np.uint8)
-        #     img_corr = Image.fromarray(img_corr)
-        #     img_corr.save(os.path.join(linear_nuc_validation_path, f"{t}.jpg"))
+        for t in valid_temps:
+            img = images_by_temp[t]
+            img_corr = linear_apply(
+                a_linear, b_linear, ga_linear, gb_linear, img, bit_max=bit_max
+            )
+            img_corr = (img_corr / img_corr.max()) * 255.0
+            img_corr = img_corr.astype(np.uint8)
+            img_corr = Image.fromarray(img_corr)
+            img_corr.save(os.path.join(linear_nuc_validation_path, f"{t}.jpg"))
 
-        # # logger.info(f"线性校正完成！")
+        # logger.info(f"线性校正完成！")
 
-        # # ---------------- 二次曲线校正 ----------------
+        # ---------------- 二次曲线校正 ----------------
 
-        # logger.info(f"二次曲线校正...")
+        logger.info(f"二次曲线校正...")
 
-        # method_out_dir = os.path.join(quadrast_nuc_path, f"multi_point_calib.npz")
+        method_out_dir = os.path.join(quadrast_nuc_path, f"multi_point_calib.npz")
 
-        # a2_quad, a1_quad, a0_quad, _ = quadratic_fit(
-        #     it_temps_arr=train_imgs,
-        #     x_arr=selected_grays,
-        #     bit_max=bit_max,
-        #     save_path=method_out_dir,
-        # )
+        a2_quad, a1_quad, a0_quad, _ = quadratic_fit(
+            it_temps_arr=train_imgs,
+            x_arr=selected_grays,
+            bit_max=bit_max,
+            save_path=method_out_dir,
+        )
 
-        # for t in valid_temps:
-        #     img = images_by_temp[t]
-        #     img_corr = quadratic_apply(a2_quad, a1_quad, a0_quad, img, bit_max=bit_max)
-        #     img_corr = (img_corr / img_corr.max()) * 255.0
-        #     img_corr = img_corr.astype(np.uint8)
-        #     img_corr = Image.fromarray(img_corr)
-        #     img_corr.save(os.path.join(quadrast_nuc_validation_path, f"{t}.jpg"))
+        for t in valid_temps:
+            img = images_by_temp[t]
+            img_corr = quadratic_apply(a2_quad, a1_quad, a0_quad, img, bit_max=bit_max)
+            img_corr = (img_corr / img_corr.max()) * 255.0
+            img_corr = img_corr.astype(np.uint8)
+            img_corr = Image.fromarray(img_corr)
+            img_corr.save(os.path.join(quadrast_nuc_validation_path, f"{t}.jpg"))
 
-        # logger.info(f"二次曲线校正完成！")
+        logger.info(f"二次曲线校正完成！")
 
 
 # ------------------------ CLI ------------------------
