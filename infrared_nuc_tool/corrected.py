@@ -95,21 +95,31 @@ def run_pipeline(
                 logger.info(f"Warning: {cur_it_temp_path} read mean value failed!")
                 continue
 
-            images_by_temp[temperature] = img_med
-            mean_y_by_temp[temperature] = val
-            all_temp_images.append(img_med)
-            valid_temperatures.append(temperature)
+            if val > 2000 and val < 14000:
 
-            # 不用浮点作键，量化一下
-            mean_y_by_gray[gray_key(val, step=1.0)] = temperature
+                images_by_temp[temperature] = img_med
+                mean_y_by_temp[temperature] = val
+                all_temp_images.append(img_med)
+                valid_temperatures.append(temperature)
 
-            temps_ok.append(temperature)
-            grays_ok.append(val)
+                # 不用浮点作键，量化一下
+                mean_y_by_gray[gray_key(val, step=1.0)] = temperature
+
+                temps_ok.append(temperature)
+                grays_ok.append(val)
 
         # 计算坏点（所有温度坏点的并集）
         if len(all_temp_images) > 0:
             logger.info(f"检测坏点中，共{len(all_temp_images)}个温度点...")
-            all_temp_images_array = np.array(all_temp_images)  # (num_temps, height, width)
+            all_temp_images_array_raw = np.array(all_temp_images)  # (num_temps, height, width)
+
+            all_temp_images_array = all_temp_images_array_raw[::10]
+
+            if len(all_temp_images_array) == 0:
+                all_temp_images_array = all_temp_images_array_raw
+            else:
+                sampled_valid_temperatures = valid_temperatures[::5]
+                sampled_all_temp_images = all_temp_images[::5]
             
             # 使用3sigma方法检测坏点
             bad_pixel_map = detect_bp_by_3sigma_generic_filter(all_temp_images_array, sigma=3.0, window_size=88)
@@ -122,24 +132,30 @@ def run_pipeline(
             logger.info(f"坏点检测完成: {bad_pixel_count}/{total_pixels} ({bad_pixel_ratio:.2f}%)")
             
             # 为每个温度生成带坏点标记的中值图
-            for i, temperature in enumerate(valid_temperatures):
-                img_med = all_temp_images[i]
+            # 使用相同的采样间隔
+            # sampled_valid_temperatures = valid_temperatures[::5]
+            # sampled_all_temp_images = all_temp_images[::5]
+            
+            for i, temperature in enumerate(sampled_valid_temperatures):
                 
-                # 创建RGB图像用于标记坏点
-                if len(img_med.shape) == 2:
-                    # 灰度图转RGB
-                    img_med = img_med / bit_max * 255.0
-                    img_rgb = cv2.cvtColor(img_med.astype(np.uint8), cv2.COLOR_GRAY2RGB)
-                else:
-                    img_rgb = img_med.copy()
-                    img_rgb = img_rgb / bit_max * 255.0
-                
-                # 将坏点标记为红色
-                img_rgb[bad_pixel_map] = [255, 0, 0]  # 红色通道
-                
-                # 保存带坏点标记的图像
-                bad_pixel_img_path = os.path.join(bad_pixel_vis_path, f"bad_pixels_{temperature}du.png")
-                cv2.imwrite(bad_pixel_img_path, img_rgb)
+                if i == len(sampled_valid_temperatures) // 2:
+                    img_med = sampled_all_temp_images[i]
+                    
+                    # 创建RGB图像用于标记坏点
+                    if len(img_med.shape) == 2:
+                        # 灰度图转RGB
+                        img_med = img_med / bit_max * 255.0
+                        img_rgb = cv2.cvtColor(img_med.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+                    else:
+                        img_rgb = img_med.copy()
+                        img_rgb = img_rgb / bit_max * 255.0
+                    
+                    # 将坏点标记为红色
+                    img_rgb[bad_pixel_map] = [255, 0, 0]  # 红色通道
+                    
+                    # 保存带坏点标记的图像
+                    bad_pixel_img_path = os.path.join(bad_pixel_vis_path, f"bad_pixels_{temperature}du.png")
+                    cv2.imwrite(bad_pixel_img_path, img_rgb)
                 
             # 保存坏点掩码
             bad_pixel_mask = os.path.join(bad_pixel_mask_path, "blind_pixels.npz")
@@ -209,18 +225,27 @@ def run_pipeline(
                 f"Warning: {wave}-{exposure//5000}ms-{temperature} C linear calibration failed!"
             )
             continue
+        
+        t = valid_temps[len(valid_temps) // 2]
+        img = images_by_temp[t]
+        img_corr = linear_apply(
+            a_linear, b_linear, ga_linear, gb_linear, img, bit_max=bit_max
+        )
+        img_corr = (img_corr / img_corr.max()) * 255.0
+        img_corr = img_corr.astype(np.uint8)
+        img_corr = Image.fromarray(img_corr)
+        img_corr.save(os.path.join(linear_nuc_validation_path, f"{t}.jpg"))
+        # for t in valid_temps:
+        #     img = images_by_temp[t]
+        #     img_corr = linear_apply(
+        #         a_linear, b_linear, ga_linear, gb_linear, img, bit_max=bit_max
+        #     )
+        #     img_corr = (img_corr / img_corr.max()) * 255.0
+        #     img_corr = img_corr.astype(np.uint8)
+        #     img_corr = Image.fromarray(img_corr)
+        #     img_corr.save(os.path.join(linear_nuc_validation_path, f"{t}.jpg"))
 
-        for t in valid_temps:
-            img = images_by_temp[t]
-            img_corr = linear_apply(
-                a_linear, b_linear, ga_linear, gb_linear, img, bit_max=bit_max
-            )
-            img_corr = (img_corr / img_corr.max()) * 255.0
-            img_corr = img_corr.astype(np.uint8)
-            img_corr = Image.fromarray(img_corr)
-            img_corr.save(os.path.join(linear_nuc_validation_path, f"{t}.jpg"))
-
-        # logger.info(f"线性校正完成！")
+        logger.info(f"线性校正完成！")
 
         # ---------------- 二次曲线校正 ----------------
 
@@ -234,14 +259,20 @@ def run_pipeline(
             bit_max=bit_max,
             save_path=method_out_dir,
         )
-
-        for t in valid_temps:
-            img = images_by_temp[t]
-            img_corr = quadratic_apply(a2_quad, a1_quad, a0_quad, img, bit_max=bit_max)
-            img_corr = (img_corr / img_corr.max()) * 255.0
-            img_corr = img_corr.astype(np.uint8)
-            img_corr = Image.fromarray(img_corr)
-            img_corr.save(os.path.join(quadrast_nuc_validation_path, f"{t}.jpg"))
+        t = valid_temps[len(valid_temps) // 2]
+        img = images_by_temp[t]
+        img_corr = quadratic_apply(a2_quad, a1_quad, a0_quad, img, bit_max=bit_max)
+        img_corr = (img_corr / img_corr.max()) * 255.0
+        img_corr = img_corr.astype(np.uint8)
+        img_corr = Image.fromarray(img_corr)
+        img_corr.save(os.path.join(quadrast_nuc_validation_path, f"{t}.jpg"))
+        # for t in valid_temps:
+        #     img = images_by_temp[t]
+        #     img_corr = quadratic_apply(a2_quad, a1_quad, a0_quad, img, bit_max=bit_max)
+        #     img_corr = (img_corr / img_corr.max()) * 255.0
+        #     img_corr = img_corr.astype(np.uint8)
+        #     img_corr = Image.fromarray(img_corr)
+        #     img_corr.save(os.path.join(quadrast_nuc_validation_path, f"{t}.jpg"))
 
         logger.info(f"二次曲线校正完成！")
 
