@@ -95,18 +95,29 @@ def run_pipeline(
                 logger.info(f"Warning: {cur_it_temp_path} read mean value failed!")
                 continue
 
-            if val > 2000 and val < 14000:
+            # if wave == "lwir" and val > 2000 and val < 12000:
 
-                images_by_temp[temperature] = img_med
-                mean_y_by_temp[temperature] = val
-                all_temp_images.append(img_med)
-                valid_temperatures.append(temperature)
+            #     images_by_temp[temperature] = img_med
+            #     mean_y_by_temp[temperature] = val
+            #     all_temp_images.append(img_med)
+            #     valid_temperatures.append(temperature)
 
-                # 不用浮点作键，量化一下
-                mean_y_by_gray[gray_key(val, step=1.0)] = temperature
+            #     # 不用浮点作键，量化一下
+            #     mean_y_by_gray[gray_key(val, step=1.0)] = temperature
 
-                temps_ok.append(temperature)
-                grays_ok.append(val)
+            #     temps_ok.append(temperature)
+            #     grays_ok.append(val)
+
+            images_by_temp[temperature] = img_med
+            mean_y_by_temp[temperature] = val
+            all_temp_images.append(img_med)
+            valid_temperatures.append(temperature)
+
+            # 不用浮点作键，量化一下
+            mean_y_by_gray[gray_key(val, step=1.0)] = temperature
+
+            temps_ok.append(temperature)
+            grays_ok.append(val)
 
         # 计算坏点（所有温度坏点的并集）
         if len(all_temp_images) > 0:
@@ -207,7 +218,7 @@ def run_pipeline(
 
         logger.info(f"选择的温度与灰度值为：{selected_temps} {selected_grays}")
 
-        # ---------------- 线性校正 ----------------
+        # # ---------------- 线性校正 ----------------
 
         logger.info(f"线性校正...")
 

@@ -222,185 +222,413 @@ def quadratic_fit(
     it_temps_arr: np.ndarray, x_arr: np.ndarray, bit_max: int, save_path=None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    适用于中/长波的二次校正, 映射到bit_max
+    适用于中/长波的二次校正（鲁棒版，自适应高低积分时间），映射到 bit_max/期望灰度
     数据: 某个积分时间下的不同温度点数据
-    校正公式: 对每像元，用 (X -> y) 拟合: y ≈ a2*X^2 + a1*X + a0
-    用np.polyfit计算出a_ij, b_ij和c_ij
+    拟合: 对每像元，用 (观测灰度 X -> 期望灰度 y) 拟合 y ≈ a2*X^2 + a1*X + a0
 
-    :param it_temps_arr: (N, H, W) 同一积分时间下, 多温度点的时域均值图像数组
-    :param x_arr: (N,) 温度点/每个温度点的理想期望值
-    :param bit_max: 原始位宽上限（用于判定近黑/近饱和）
-    :param save_path: 保存路径
-    :return: 校正后的系数 .npz文件
+    Args:
+        it_temps_arr: (N, H, W) 同一积分时间下，多温度点的时域均值图像数组（建议 uint16 / float32）
+        x_arr:        (N,) 每个温度点对应的“期望灰度”或“理想响应”（可按你的标定定义）
+        bit_max:      位深上限（用于判断 0 / 饱和）
+        save_path:    若不为 None，则保存 npz（包含 a2,a1,a0,bad）
 
-    Note:
-        1. 输入图像列表 images 中的每个元素应为 uint16 类型
-        2. 期望的灰度值列表 x_arr 应与输入图像列表长度一致
-        3. 坏点标记数组 bad_pixel_map 用于标记哪些像素在拟合过程中被认为是坏点
-        4. 拟合过程中，如果像素值为 0 或 16383 则认为该像素为坏点
+    Returns:
+        (a2_arr, a1_arr, a0_arr, bad_pixel_map)
+        bad_pixel_map: 1=坏点/回退（建议应用端做空间插值或单位映射兜底）
     """
 
-    # ------- 可调鲁棒参数（按需修改）-------
-    black_lo_frac = 0.05  # 低端裁剪阈值: x <= black_lo_frac*bit_max 视作近黑无效
-    sat_hi_frac = 0.95  # 高端裁剪阈值: x >= sat_hi_frac*bit_max 视作近饱和无效
-    min_pts = 5  # 至少需要的有效点数（<5 时二次拟合容易不稳）
-    huber_delta = 20.0  # Huber 损失阈值（单位=“y”的单位; 你用的 x_arr 的尺度）
-    mad_k = 3.5  # MAD * k 之外的点视作离群点
-    max_iter = 3  # 鲁棒迭代次数（残差裁剪 + Huber 重加权）
-    allow_linear_fallback = True  # 二次拟合点数不足或不稳时回退到一次拟合
-    drop_tail_plateau = True  # 额外检测“早饱和平台”并剔尾
-    plateau_dx_eps = 1.0  # 平台检测：相邻两点 x 差<=此阈值，视作平台
-    plateau_min_run = 2  # 平台检测：连续平台点的最小长度（计尾端）
+    # ===== 可调鲁棒参数 =====
+    min_pts_base = 3              # 最少有效点（归一化+二次至少需要3）
+    huber_delta  = 20.0           # Huber 阈值（以 y 的单位计）
+    mad_k        = 3.5            # MAD * k 之外的点视作离群
+    max_iter     = 3              # 鲁棒迭代轮数
+    neg_deriv_ratio_thresh = 0.6  # 导数为负比例超此阈值则判为不稳（退化到线性）
+    sat_gate_ratio = 0.10         # 饱和占比门限，≥该值认为“高积分时间样态”
 
-    images = it_temps_arr.astype(np.float32)  # (N,H,W)
-    wish_gray = np.asarray(x_arr, dtype=np.float32)  # (N,)
+    images = np.asarray(it_temps_arr, dtype=np.float32)  # (N,H,W)
+    wish_gray = np.asarray(x_arr, dtype=np.float32)      # (N,)
     N, H, W = images.shape
 
     a2_arr = np.zeros((H, W), dtype=np.float32)
     a1_arr = np.zeros((H, W), dtype=np.float32)
     a0_arr = np.zeros((H, W), dtype=np.float32)
-    bad_pixel_map = np.zeros((H, W), dtype=np.uint8)  # 1=坏点
+    bad_pixel_map = np.zeros((H, W), dtype=np.uint8)     # 1=坏点/回退
 
-    low_thr = black_lo_frac * float(bit_max)
-    high_thr = sat_hi_frac * float(bit_max)
+    # ---------- 内部小工具 ----------
+    def _mad(x):
+        med = np.median(x)
+        return np.median(np.abs(x - med)) + 1e-12
+
+    def _huber_weights(r, delta):
+        a = np.abs(r)
+        w = np.ones_like(r, dtype=np.float32)
+        big = a > delta
+        # w = delta/|r|
+        w[big] = delta / (a[big] + 1e-12)
+        return w
 
     def _polyfit_w(x, y, deg, w=None):
-        # numpy>=1.22 支持 w=sample_weights
+        # numpy>=1.22 支持 w=样本权重
         if w is not None:
             return np.polyfit(x, y, deg=deg, w=w, rcond=None)
         return np.polyfit(x, y, deg=deg, rcond=None)
 
-    def _mad(x):
-        med = np.median(x)
-        return np.median(np.abs(x - med)) + 1e-6
-
-    def _huber_weights(r, delta):
-        # |r|<=delta -> w=1; 否则 w=delta/|r|
-        a = np.abs(r)
-        w = np.ones_like(r, dtype=np.float32)
-        big = a > delta
-        w[big] = delta / a[big]
-        return w
-
-    # 可选：检测尾端平台（“早饱和但未到 bit_max”的情况），剔除尾段平台点
-    def _drop_tail_plateau(x_sorted, y_sorted):
+    def _drop_tail_plateau(x_sorted, y_sorted, dx_eps, min_run=3):
         """
-        x_sorted, y_sorted 已按 y（或温度）顺序排列。
-        若尾端出现连续平台(Δx很小)则剔除末尾这段。
+        尾端平台剔除：从尾部起，连续若干相邻点满足 Δx<=dx_eps 则剔除这一段。
+        x_sorted/y_sorted 已按 y 升序对齐（通常代表温度/期望递增）。
         """
-        if len(x_sorted) <= 3:
+        L = len(x_sorted)
+        if L <= 3:
             return x_sorted, y_sorted
         dx = np.diff(x_sorted)
-        # 从尾端往前找连续 dx<=阈值的 run
         run = 0
-        for k in range(len(dx) - 1, -1, -1):
-            if dx[k] <= plateau_dx_eps:
+        for k in range(L - 2, -1, -1):
+            if dx[k] <= dx_eps:
                 run += 1
             else:
                 break
-        if run >= plateau_min_run:
-            keep_n = len(x_sorted) - run
+        if run >= min_run:
+            keep_n = L - run
             if keep_n >= 3:
                 return x_sorted[:keep_n], y_sorted[:keep_n]
         return x_sorted, y_sorted
 
-    for i in range(H):
-        # 为了速度，这里只在列上循环；也可以完全双层循环，清晰但更慢
-        for j in range(W):
-            x = images[:, i, j]  # 像元在不同温度点的灰度（自变量）
-            y = wish_gray  # 同一组“期望值”（因变量）
+    def _to_original_coef_from_unit(coef_n, x_min, x_max, y_min, y_max):
+        """
+        已在单位区间上拟合: y_n = a2n*x_n^2 + a1n*x_n + a0n,
+        映射: x_n=(x-x_min)/sx, y = y_min + ty*y_n
+        反解出原尺度上的 (A2, A1, A0) 使得 y = A2*x^2 + A1*x + A0
+        """
+        a2n, a1n, a0n = coef_n if len(coef_n) == 3 else (0.0, coef_n[0], coef_n[1])
+        sx = (x_max - x_min) + 1e-12
+        ty = (y_max - y_min) + 1e-12
 
-            # 1) 基于绝对阈值的端点裁剪（避免 0/bit_max 的硬编码误判）
-            valid = (x > low_thr) & (x < high_thr) & np.isfinite(x)
-            if valid.sum() < min_pts:
-                # 数据太少 -> 记坏点
+        A2 = ty * (a2n / (sx ** 2))
+        A1 = ty * (a1n / sx - 2.0 * a2n * x_min / (sx ** 2))
+        A0 = ty * (a2n * (x_min ** 2) / (sx ** 2) - a1n * x_min / sx + a0n) + y_min
+        return float(A2), float(A1), float(A0)
+
+    # ---------- 主循环（逐像元） ----------
+    for i in range(H):
+        # 可视需要加进度打印；此处保持安静
+        for j in range(W):
+            x = images[:, i, j]   # 该像元在 N 个温点上的观测灰度
+            y = wish_gray         # 对应的期望灰度
+
+            # 0) 基本有效性：去掉明确的 0 / 满刻度 / NaN/Inf
+            finite = np.isfinite(x)
+            base_valid = finite & (x > 0.0) & (x < float(bit_max))
+            if base_valid.sum() < min_pts_base:
+                # 回退为单位映射 + 标坏点
+                a2_arr[i, j], a1_arr[i, j], a0_arr[i, j] = 0.0, 1.0, 0.0
                 bad_pixel_map[i, j] = 1
                 continue
 
-            xv = x[valid]
-            yv = y[valid]
+            xv = x[base_valid]
+            yv = y[base_valid]
 
-            # 为稳定性，按“温度/期望值”的顺序排序（通常 y 随温度单调）
+            # 1) 自适应：依据饱和占比决定阈值与平台策略
+            sat_ratio = (x >= 0.98 * float(bit_max)).mean()
+            if sat_ratio >= sat_gate_ratio:
+                # 高积分时间样态：放宽端点、允许平台剔除
+                valid = (x > 0.0) & (x < float(bit_max)) & np.isfinite(x)
+                xv, yv = x[valid], y[valid]
+                # 平台阈值随位深缩放
+                dx_eps = max(2.0, 0.001 * float(bit_max))  # 12bit≈4, 16bit≈65
+                enable_drop_plateau = True
+            else:
+                # 低积分时间样态：更稳健的分位数裁剪，通常无需平台剔除
+                xf = x[base_valid]
+                if len(xf) >= 8:
+                    lo, hi = np.percentile(xf, [1, 99])
+                    valid = (x > lo) & (x < hi) & np.isfinite(x)
+                    xv, yv = x[valid], y[valid]
+                else:
+                    # 样本少时沿用 base_valid
+                    xv, yv = xv, yv
+                dx_eps = None
+                enable_drop_plateau = False
+
+            if len(xv) < min_pts_base:
+                a2_arr[i, j], a1_arr[i, j], a0_arr[i, j] = 0.0, 1.0, 0.0
+                bad_pixel_map[i, j] = 1
+                continue
+
+            # 2) 为稳定性，按“期望值”排序（通常随温度单调）
             order = np.argsort(yv)
             xv, yv = xv[order], yv[order]
 
-            # 2) 可选：尾端平台检测，剔除“早饱和”导致的平坦段
-            if drop_tail_plateau:
-                xv, yv = _drop_tail_plateau(xv, yv)
-                if len(xv) < min_pts:
+            # 3) 可选：尾端平台剔除（仅高积分时间样态启用）
+            if enable_drop_plateau:
+                xv, yv = _drop_tail_plateau(xv, yv, dx_eps=dx_eps, min_run=3)
+                if len(xv) < min_pts_base:
+                    a2_arr[i, j], a1_arr[i, j], a0_arr[i, j] = 0.0, 1.0, 0.0
                     bad_pixel_map[i, j] = 1
                     continue
 
-            # 3) 初始二次拟合（点数不足则考虑线性回退）
-            deg = 2 if len(xv) >= 3 else 1
-            try:
-                coef = _polyfit_w(xv, yv, deg=deg)  # coef: [a2,a1,a0] 或 [a1,a0]
-            except Exception:
+            # 4) 归一化到 [0,1] 以避免高位深病态
+            x_min, x_max = float(np.min(xv)), float(np.max(xv))
+            y_min, y_max = float(np.min(yv)), float(np.max(yv))
+            sx = (x_max - x_min) + 1e-12
+            ty = (y_max - y_min) + 1e-12
+            xvn = (xv - x_min) / sx
+            yvn = (yv - y_min) / ty
+
+            # 若归一化后仍点数不足，直接回退
+            if len(xvn) < min_pts_base:
+                a2_arr[i, j], a1_arr[i, j], a0_arr[i, j] = 0.0, 1.0, 0.0
                 bad_pixel_map[i, j] = 1
                 continue
 
-            # 4) 鲁棒迭代：MAD裁剪 + Huber加权
-            last_inlier_count = len(xv)
+            # 5) 初始二次拟合
+            deg = 2 if len(xvn) >= 3 else 1
+            try:
+                coef_n = _polyfit_w(xvn, yvn, deg=deg)
+            except Exception:
+                a2_arr[i, j], a1_arr[i, j], a0_arr[i, j] = 0.0, 1.0, 0.0
+                bad_pixel_map[i, j] = 1
+                continue
+
+            # 6) 鲁棒迭代：MAD裁剪 + Huber 重加权
+            last_inlier = len(xvn)
             for _ in range(max_iter):
-                yhat = np.polyval(coef, xv)
-                r = yv - yhat
+                yhat = np.polyval(coef_n, xvn)
+                r = yvn - yhat
                 mad = _mad(r)
                 inliers = np.abs(r) <= (mad_k * mad)
                 if inliers.sum() < (3 if deg == 2 else 2):
-                    # 太少则停止
                     break
-                xv_in = xv[inliers]
-                yv_in = yv[inliers]
+                x_in = xvn[inliers]
+                y_in = yvn[inliers]
                 r_in = r[inliers]
-                w = _huber_weights(r_in, huber_delta)
+                w = _huber_weights(r_in, huber_delta / (ty + 1e-12))  # 将阈值缩放到 y_n 空间
 
                 try:
-                    coef_new = _polyfit_w(xv_in, yv_in, deg=deg, w=w)
+                    coef_new = _polyfit_w(x_in, y_in, deg=deg, w=w)
                 except Exception:
                     break
 
-                coef = coef_new
-                if inliers.sum() == last_inlier_count:
-                    # 收敛（inlier 数未变化）
+                coef_n = coef_new
+                if inliers.sum() == last_inlier:
                     break
-                last_inlier_count = inliers.sum()
+                last_inlier = inliers.sum()
 
-            # 5) 若二次不稳或点数仍偏少，尝试线性回退
-            if allow_linear_fallback and deg == 2:
-                # 简单稳健性检查：导数在样本域内大面积为负可能不合理（可根据业务选择）
-                xs = np.linspace(np.min(xv), np.max(xv), num=5, dtype=np.float32)
-                deriv = 2.0 * coef[0] * xs + coef[1]
-                if (deriv < 0).mean() > 0.6 or last_inlier_count < min_pts:
-                    # 回退到线性
+            # 7) 稳定性检查：导数在 [0,1] 区间的大面积为负 → 线性回退
+            if deg == 2:
+                a2n, a1n, _ = coef_n
+                xs = np.linspace(0.0, 1.0, num=9, dtype=np.float32)
+                deriv = (ty / sx) * (2.0 * a2n * xs + a1n)  # dy/dx，比例因子为正，不影响符号
+                if (deriv < 0).mean() > neg_deriv_ratio_thresh:
+                    # 线性回退（在单位区间上重拟合）
                     try:
-                        coef_lin = _polyfit_w(xv, yv, deg=1)
-                        # 将线性系数扩展到二次形态，便于统一返回
-                        a2, a1, a0 = 0.0, float(coef_lin[0]), float(coef_lin[1])
+                        coef_n = _polyfit_w(xvn, yvn, deg=1)
+                        deg = 1
                     except Exception:
+                        a2_arr[i, j], a1_arr[i, j], a0_arr[i, j] = 0.0, 1.0, 0.0
                         bad_pixel_map[i, j] = 1
                         continue
-                else:
-                    a2, a1, a0 = float(coef[0]), float(coef[1]), float(coef[2])
-            else:
-                # 统一到 (a2,a1,a0)
-                if deg == 2:
-                    a2, a1, a0 = float(coef[0]), float(coef[1]), float(coef[2])
-                else:
-                    a2, a1, a0 = 0.0, float(coef[0]), float(coef[1])
 
-            a2_arr[i, j] = a2
-            a1_arr[i, j] = a1
-            a0_arr[i, j] = a0
+            # 8) 将单位区间系数还原到原尺度
+            try:
+                A2, A1, A0 = _to_original_coef_from_unit(coef_n, x_min, x_max, y_min, y_max)
+            except Exception:
+                A2, A1, A0 = 0.0, 1.0, 0.0
+                bad_pixel_map[i, j] = 1
+
+            # 9) 最终写回
+            a2_arr[i, j] = A2
+            a1_arr[i, j] = A1
+            a0_arr[i, j] = A0
+            # 是否标坏点：若发生过回退/过度裁剪你也可置1，这里仅在明确失败时置1
 
     if save_path is not None:
-        print(
-            f"[quadratic_fit] Saving a2_arr, a1_arr, a0_arr, bad_pixel_map to > {save_path}"
-        )
-        np.savez_compressed(
-            save_path, a2=a2_arr, a1=a1_arr, a0=a0_arr, bad=bad_pixel_map
-        )
+        print(f"[quadratic_fit] Saving a2_arr, a1_arr, a0_arr, bad_pixel_map to > {save_path}")
+        np.savez_compressed(save_path, a2=a2_arr, a1=a1_arr, a0=a0_arr, bad=bad_pixel_map)
 
     return a2_arr, a1_arr, a0_arr, bad_pixel_map
+
+
+    # """
+    # 适用于中/长波的二次校正, 映射到bit_max
+    # 数据: 某个积分时间下的不同温度点数据
+    # 校正公式: 对每像元，用 (X -> y) 拟合: y ≈ a2*X^2 + a1*X + a0
+    # 用np.polyfit计算出a_ij, b_ij和c_ij
+
+    # :param it_temps_arr: (N, H, W) 同一积分时间下, 多温度点的时域均值图像数组
+    # :param x_arr: (N,) 温度点/每个温度点的理想期望值
+    # :param bit_max: 原始位宽上限（用于判定近黑/近饱和）
+    # :param save_path: 保存路径
+    # :return: 校正后的系数 .npz文件
+
+    # Note:
+    #     1. 输入图像列表 images 中的每个元素应为 uint16 类型
+    #     2. 期望的灰度值列表 x_arr 应与输入图像列表长度一致
+    #     3. 坏点标记数组 bad_pixel_map 用于标记哪些像素在拟合过程中被认为是坏点
+    #     4. 拟合过程中，如果像素值为 0 或 16383 则认为该像素为坏点
+    # """
+
+    # # ------- 可调鲁棒参数（按需修改）-------
+    # black_lo_frac = 0.05  # 低端裁剪阈值: x <= black_lo_frac*bit_max 视作近黑无效
+    # sat_hi_frac = 0.95  # 高端裁剪阈值: x >= sat_hi_frac*bit_max 视作近饱和无效
+    # min_pts = 5  # 至少需要的有效点数（<5 时二次拟合容易不稳）
+    # huber_delta = 20.0  # Huber 损失阈值（单位=“y”的单位; 你用的 x_arr 的尺度）
+    # mad_k = 3.5  # MAD * k 之外的点视作离群点
+    # max_iter = 3  # 鲁棒迭代次数（残差裁剪 + Huber 重加权）
+    # allow_linear_fallback = True  # 二次拟合点数不足或不稳时回退到一次拟合
+    # drop_tail_plateau = True  # 额外检测“早饱和平台”并剔尾
+    # plateau_dx_eps = 1.0  # 平台检测：相邻两点 x 差<=此阈值，视作平台
+    # plateau_min_run = 2  # 平台检测：连续平台点的最小长度（计尾端）
+
+    # images = it_temps_arr.astype(np.float32)  # (N,H,W)
+    # wish_gray = np.asarray(x_arr, dtype=np.float32)  # (N,)
+    # N, H, W = images.shape
+
+    # a2_arr = np.zeros((H, W), dtype=np.float32)
+    # a1_arr = np.zeros((H, W), dtype=np.float32)
+    # a0_arr = np.zeros((H, W), dtype=np.float32)
+    # bad_pixel_map = np.zeros((H, W), dtype=np.uint8)  # 1=坏点
+
+    # low_thr = black_lo_frac * float(bit_max)
+    # high_thr = sat_hi_frac * float(bit_max)
+
+    # def _polyfit_w(x, y, deg, w=None):
+    #     # numpy>=1.22 支持 w=sample_weights
+    #     if w is not None:
+    #         return np.polyfit(x, y, deg=deg, w=w, rcond=None)
+    #     return np.polyfit(x, y, deg=deg, rcond=None)
+
+    # def _mad(x):
+    #     med = np.median(x)
+    #     return np.median(np.abs(x - med)) + 1e-6
+
+    # def _huber_weights(r, delta):
+    #     # |r|<=delta -> w=1; 否则 w=delta/|r|
+    #     a = np.abs(r)
+    #     w = np.ones_like(r, dtype=np.float32)
+    #     big = a > delta
+    #     w[big] = delta / a[big]
+    #     return w
+
+    # # 可选：检测尾端平台（“早饱和但未到 bit_max”的情况），剔除尾段平台点
+    # def _drop_tail_plateau(x_sorted, y_sorted):
+    #     """
+    #     x_sorted, y_sorted 已按 y（或温度）顺序排列。
+    #     若尾端出现连续平台(Δx很小)则剔除末尾这段。
+    #     """
+    #     if len(x_sorted) <= 3:
+    #         return x_sorted, y_sorted
+    #     dx = np.diff(x_sorted)
+    #     # 从尾端往前找连续 dx<=阈值的 run
+    #     run = 0
+    #     for k in range(len(dx) - 1, -1, -1):
+    #         if dx[k] <= plateau_dx_eps:
+    #             run += 1
+    #         else:
+    #             break
+    #     if run >= plateau_min_run:
+    #         keep_n = len(x_sorted) - run
+    #         if keep_n >= 3:
+    #             return x_sorted[:keep_n], y_sorted[:keep_n]
+    #     return x_sorted, y_sorted
+
+    # for i in range(H):
+    #     # 为了速度，这里只在列上循环；也可以完全双层循环，清晰但更慢
+    #     for j in range(W):
+    #         x = images[:, i, j]  # 像元在不同温度点的灰度（自变量）
+    #         y = wish_gray  # 同一组“期望值”（因变量）
+
+    #         # 1) 基于绝对阈值的端点裁剪（避免 0/bit_max 的硬编码误判）
+    #         valid = (x > low_thr) & (x < high_thr) & np.isfinite(x)
+    #         if valid.sum() < min_pts:
+    #             # 数据太少 -> 记坏点
+    #             bad_pixel_map[i, j] = 1
+    #             continue
+
+    #         xv = x[valid]
+    #         yv = y[valid]
+
+    #         # 为稳定性，按“温度/期望值”的顺序排序（通常 y 随温度单调）
+    #         order = np.argsort(yv)
+    #         xv, yv = xv[order], yv[order]
+
+    #         # 2) 可选：尾端平台检测，剔除“早饱和”导致的平坦段
+    #         if drop_tail_plateau:
+    #             xv, yv = _drop_tail_plateau(xv, yv)
+    #             if len(xv) < min_pts:
+    #                 bad_pixel_map[i, j] = 1
+    #                 continue
+
+    #         # 3) 初始二次拟合（点数不足则考虑线性回退）
+    #         deg = 2 if len(xv) >= 3 else 1
+    #         try:
+    #             coef = _polyfit_w(xv, yv, deg=deg)  # coef: [a2,a1,a0] 或 [a1,a0]
+    #         except Exception:
+    #             bad_pixel_map[i, j] = 1
+    #             continue
+
+    #         # 4) 鲁棒迭代：MAD裁剪 + Huber加权
+    #         last_inlier_count = len(xv)
+    #         for _ in range(max_iter):
+    #             yhat = np.polyval(coef, xv)
+    #             r = yv - yhat
+    #             mad = _mad(r)
+    #             inliers = np.abs(r) <= (mad_k * mad)
+    #             if inliers.sum() < (3 if deg == 2 else 2):
+    #                 # 太少则停止
+    #                 break
+    #             xv_in = xv[inliers]
+    #             yv_in = yv[inliers]
+    #             r_in = r[inliers]
+    #             w = _huber_weights(r_in, huber_delta)
+
+    #             try:
+    #                 coef_new = _polyfit_w(xv_in, yv_in, deg=deg, w=w)
+    #             except Exception:
+    #                 break
+
+    #             coef = coef_new
+    #             if inliers.sum() == last_inlier_count:
+    #                 # 收敛（inlier 数未变化）
+    #                 break
+    #             last_inlier_count = inliers.sum()
+
+    #         # 5) 若二次不稳或点数仍偏少，尝试线性回退
+    #         if allow_linear_fallback and deg == 2:
+    #             # 简单稳健性检查：导数在样本域内大面积为负可能不合理（可根据业务选择）
+    #             xs = np.linspace(np.min(xv), np.max(xv), num=5, dtype=np.float32)
+    #             deriv = 2.0 * coef[0] * xs + coef[1]
+    #             if (deriv < 0).mean() > 0.6 or last_inlier_count < min_pts:
+    #                 # 回退到线性
+    #                 try:
+    #                     coef_lin = _polyfit_w(xv, yv, deg=1)
+    #                     # 将线性系数扩展到二次形态，便于统一返回
+    #                     a2, a1, a0 = 0.0, float(coef_lin[0]), float(coef_lin[1])
+    #                 except Exception:
+    #                     bad_pixel_map[i, j] = 1
+    #                     continue
+    #             else:
+    #                 a2, a1, a0 = float(coef[0]), float(coef[1]), float(coef[2])
+    #         else:
+    #             # 统一到 (a2,a1,a0)
+    #             if deg == 2:
+    #                 a2, a1, a0 = float(coef[0]), float(coef[1]), float(coef[2])
+    #             else:
+    #                 a2, a1, a0 = 0.0, float(coef[0]), float(coef[1])
+
+    #         a2_arr[i, j] = a2
+    #         a1_arr[i, j] = a1
+    #         a0_arr[i, j] = a0
+
+    # if save_path is not None:
+    #     print(
+    #         f"[quadratic_fit] Saving a2_arr, a1_arr, a0_arr, bad_pixel_map to > {save_path}"
+    #     )
+    #     np.savez_compressed(
+    #         save_path, a2=a2_arr, a1=a1_arr, a0=a0_arr, bad=bad_pixel_map
+    #     )
+
+    # return a2_arr, a1_arr, a0_arr, bad_pixel_map
 
     # images = it_temps_arr.astype(np.float32)
     # wish_gray = np.array(x_arr, dtype=np.float32)
