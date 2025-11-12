@@ -136,15 +136,16 @@ class ImageValidator:
         )
 
         self.logger = logging.getLogger(__name__)
+        input_type = "文件" if self.input_dir.is_file() else "目录"
         self.logger.info(
-            f"初始化验证器 - 输入目录: {self.input_dir}, 校正方法: {self.method}"
+            f"初始化验证器 - 输入{input_type}: {self.input_dir}, 校正方法: {self.method}"
         )
 
     def _validate_inputs(self):
         """验证输入参数"""
-        # 检查输入目录
+        # 检查输入路径（文件或目录）
         if not self.input_dir.exists():
-            raise FileNotFoundError(f"输入目录不存在: {self.input_dir}")
+            raise FileNotFoundError(f"输入路径不存在: {self.input_dir}")
 
         # 检查校正方法
         if self.method not in self.supported_methods:
@@ -155,18 +156,34 @@ class ImageValidator:
         # 检查图像文件
         image_files = self._get_image_files()
         if not image_files:
-            raise ValueError(f"在目录 {self.input_dir} 中未找到支持的图像文件")
+            if self.input_dir.is_file():
+                raise ValueError(f"文件 {self.input_dir} 不是支持的图像格式")
+            else:
+                raise ValueError(f"在目录 {self.input_dir} 中未找到支持的图像文件")
 
         self.logger.info(f"找到 {len(image_files)} 个图像文件")
 
     def _get_image_files(self) -> List[Path]:
-        """获取图像文件列表"""
-        image_files = []
-        for ext in self.supported_formats:
-            image_files.extend(self.input_dir.glob(f"*{ext}"))
-            image_files.extend(self.input_dir.glob(f"*{ext.upper()}"))
-
-        return sorted(image_files)
+        """获取图像文件列表，支持单个文件或目录"""
+        # 判断是文件还是目录
+        if self.input_dir.is_file():
+            # 如果是单个文件，检查扩展名是否支持
+            file_ext = self.input_dir.suffix.lower()
+            if file_ext in self.supported_formats:
+                return [self.input_dir]
+            else:
+                # 文件扩展名不支持，返回空列表
+                return []
+        elif self.input_dir.is_dir():
+            # 如果是目录，按原来的逻辑处理
+            image_files = []
+            for ext in self.supported_formats:
+                image_files.extend(self.input_dir.glob(f"*{ext}"))
+                image_files.extend(self.input_dir.glob(f"*{ext.upper()}"))
+            return sorted(image_files)
+        else:
+            # 既不是文件也不是目录
+            return []
 
     def _load_calibration_params(self) -> Optional[Dict[str, Any]]:
         """加载校正参数"""
@@ -296,9 +313,9 @@ class ImageValidator:
             return image
 
         try:
-            a2 = self.calib_params.get("a2_arr")
-            a1 = self.calib_params.get("a1_arr")
-            a0 = self.calib_params.get("a0_arr")
+            a2 = self.calib_params.get("a2")
+            a1 = self.calib_params.get("a1")
+            a0 = self.calib_params.get("a0")
 
             if a2 is None or a1 is None or a0 is None:
                 self.logger.warning("二次校正参数不完整，返回原图")
